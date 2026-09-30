@@ -116,7 +116,14 @@ export function createTsconfigResolvers({
   let onParseError: ((tsconfigFile: string) => void) | undefined
 
   const addProject = (project: Project, data?: Directory) => {
-    const tsconfigFile = project.tsconfigFile
+    // tsconfck returns native paths for root and extended configs on Windows.
+    // Cache identities, scope calculations, and watcher events use normalized paths.
+    const tsconfigFile = (project.tsconfigFile = path.normalize(
+      project.tsconfigFile
+    ))
+    project.extended?.forEach((parent) => {
+      parent.tsconfigFile = path.normalize(parent.tsconfigFile)
+    })
     const dir = path.normalize(path.dirname(tsconfigFile))
     data ??= directoryCache.get(dir)
 
@@ -135,11 +142,11 @@ export function createTsconfigResolvers({
         referenceDependencies.add(parent.tsconfigFile)
       })
       project.referenced.forEach((projectRef) => {
+        addProject(projectRef)
         referenceDependencies.add(projectRef.tsconfigFile)
         projectRef.extended?.forEach((parent) => {
           referenceDependencies.add(parent.tsconfigFile)
         })
-        addProject(projectRef)
         // Create an unrestricted resolver (no include/exclude check) for
         // referenced projects, so importers outside the reference's include
         // scope can still use its path aliases.

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as vite from 'vite'
 import * as tsconfck from 'tsconfck'
+import { normalize } from '../src/path'
 import { createTsconfigResolvers } from '../src/resolver'
 
 vi.mock('tsconfck', async (importOriginal) => {
@@ -14,8 +15,8 @@ vi.mock('tsconfck', async (importOriginal) => {
 let root: string
 
 beforeEach(async () => {
-  root = await realpath(
-    await mkdtemp(join(tmpdir(), 'vite-tsconfig-references-'))
+  root = normalize(
+    await realpath(await mkdtemp(join(tmpdir(), 'vite-tsconfig-references-')))
   )
   await Promise.all(
     ['.config', 'app', 'tests', 'excluded', 'nested'].map((dir) =>
@@ -281,7 +282,7 @@ for (const projectDiscovery of ['eager', 'lazy'] as const) {
 }
 
 function fixturePath(relative: string) {
-  return vite.normalizePath(join(root, relative))
+  return normalize(join(root, relative))
 }
 
 async function writeConfig(file: string, config: unknown) {

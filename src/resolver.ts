@@ -41,10 +41,15 @@ export function createTsconfigResolvers({
   logFile?: LogFileWriter | null
   logger: Logger
 }): TsconfigResolvers {
+  let generation = 0
   let initializing: Promise<void> | undefined
   let directoryCache: Map<string, Directory>
   let resolversByProject: WeakMap<Project, Resolver>
   let unrestrictedResolversByProject: WeakMap<Project, Resolver>
+  // Keep known reference dependencies across resets so deleted configs can be
+  // rediscovered when they are recreated (even with non-discoverable names).
+  const referenceDependencies = new Set<string>()
+  let referenceScopes: WeakMap<Project, (importer: string) => boolean>
   let isFirstParseError = true
   let hasTypeScriptDep = false
 
@@ -125,7 +130,15 @@ export function createTsconfigResolvers({
     // Referenced projects must be added first, so they can override
     // the parent project's paths if both are in the same directory.
     if (project.referenced) {
+      referenceScopes.set(project, getProjectIncluder(project))
+      project.extended?.forEach((parent) => {
+        referenceDependencies.add(parent.tsconfigFile)
+      })
       project.referenced.forEach((projectRef) => {
+        referenceDependencies.add(projectRef.tsconfigFile)
+        projectRef.extended?.forEach((parent) => {
+          referenceDependencies.add(parent.tsconfigFile)
+        })
         addProject(projectRef)
         // Create an unrestricted resolver (no include/exclude check) for
         // referenced projects, so importers outside the reference's include
@@ -161,7 +174,11 @@ export function createTsconfigResolvers({
   }
 
   const loadProject = async (tsconfigFile: string, data?: Directory) => {
+    const loadingGeneration = generation
     const project = await parseProject(tsconfigFile)
+    if (loadingGeneration !== generation) {
+      return
+    }
     if (project) {
       addProject(project, data)
     } else {
@@ -192,6 +209,7 @@ export function createTsconfigResolvers({
   }
 
   const loadEagerProjects = async () => {
+    const loadingGeneration = generation
     let projectPaths: string[]
     if (opts.projects) {
       projectPaths = opts.projects.map((file) => {
@@ -210,6 +228,9 @@ export function createTsconfigResolvers({
       })
     }
 
+    if (loadingGeneration !== generation) {
+      return
+    }
     debug('Eagerly parsing these projects:', projectPaths)
 
     await Promise.all(Array.from(new Set(projectPaths), (p) => loadProject(p)))
@@ -219,17 +240,23 @@ export function createTsconfigResolvers({
   }
 
   const resetResolvers = () => {
+    generation++
     directoryCache = new Map()
     resolversByProject = new WeakMap()
     unrestrictedResolversByProject = new WeakMap()
+    referenceScopes = new WeakMap()
     initializing = loadEagerProjects()
   }
 
   // Only used when projectDiscovery is 'lazy'.
   const discoverProjects = async (dir: NormalizedPath, data: Directory) => {
+    const loadingGeneration = generation
     debug('Searching directory for tsconfig files:', dir)
     const names = await readdir(dir).catch(() => [])
 
+    if (loadingGeneration !== generation) {
+      return
+    }
     await Promise.all(
       names
         .filter((name) => configNames.includes(name))
@@ -238,6 +265,9 @@ export function createTsconfigResolvers({
         })
     )
 
+    if (loadingGeneration !== generation) {
+      return
+    }
     if (data.projects.length) {
       sortProjects(data.projects)
       if (debug.enabled) {
@@ -291,8 +321,16 @@ export function createTsconfigResolvers({
         // packages), the referenced configs may live in sibling
         // directories that are never visited by this ancestor walk.
         // Yield their unrestricted resolvers (no include/exclude check)
-        // so imports from any directory can use referenced path aliases.
-        if (project.referenced) {
+        // so importers in the parent scope can use referenced path aliases.
+        if (
+          project.referenced &&
+          referenceScopes.get(project)?.(
+            path.relative(
+              path.dirname(project.tsconfigFile),
+              path.normalize(importer.replace(/[#?].+$/, ''))
+            )
+          )
+        ) {
           for (const ref of project.referenced) {
             const refResolver = unrestrictedResolversByProject.get(ref)
             if (refResolver) {
@@ -321,6 +359,15 @@ export function createTsconfigResolvers({
         !normalizedFile.endsWith('.json') ||
         !path.isAbsolute(normalizedFile)
       ) {
+        return
+      }
+      if (
+        referenceDependencies.has(normalizedFile) &&
+        (event === 'add' || event === 'change' || event === 'unlink')
+      ) {
+        // Parent projects retain parsed reference objects. Reparse the graph
+        // instead of leaving their unrestricted resolvers pointing at old data.
+        resetResolvers()
         return
       }
       if (event === 'add') {
@@ -447,20 +494,7 @@ function createResolver(
   })
 
   const configDir = path.normalize(path.dirname(configPath))
-
-  let outDir = compilerOptions.outDir && path.normalize(compilerOptions.outDir)
-
-  // When `tsconfck.parseNative` is used, the outDir is absolute, which
-  // is not what `getIncluder` expects.
-  if (outDir && path.isAbsolute(outDir)) {
-    outDir = path.relative(configDir, outDir)
-  }
-
-  const isIncludedRelative = getIncluder(
-    config.include?.map((p) => ensureRelative(configDir, p)),
-    config.exclude?.map((p) => ensureRelative(configDir, p)),
-    outDir
-  )
+  const isIncludedRelative = getProjectIncluder(project)
 
   const isImporterSupported = opts.loose
     ? () => true
@@ -580,6 +614,23 @@ function createResolver(
 
     return [resolvedId, true]
   }
+}
+
+function getProjectIncluder(project: Project) {
+  const configDir = path.normalize(path.dirname(project.tsconfigFile))
+  const config = project.tsconfig
+  let outDir =
+    config.compilerOptions?.outDir &&
+    path.normalize(config.compilerOptions.outDir)
+  // parseNative returns absolute paths, while getIncluder expects relative ones.
+  if (outDir && path.isAbsolute(outDir)) {
+    outDir = path.relative(configDir, outDir)
+  }
+  return getIncluder(
+    config.include?.map((p) => ensureRelative(configDir, p)),
+    config.exclude?.map((p) => ensureRelative(configDir, p)),
+    outDir
+  )
 }
 
 const defaultInclude = ['**/*']

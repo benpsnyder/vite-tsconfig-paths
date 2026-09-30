@@ -9,5 +9,5 @@
       "@/*": ["../app/*"]
     }
   },
-  "include": ["../app"]
+  "include": ["../app", "../index.ts"]
 }
